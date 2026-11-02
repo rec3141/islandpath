@@ -7,14 +7,22 @@ Hsiao et al., 2003). Works directly with GFF3 + FASTA + FAA outputs from Prokka,
 removing the dependency on GenBank (.gbk) input and broken Perl BioPerl modules.
 
 Algorithm:
-  1. Per-contig processing (each contig = different organism in metagenome)
+  1. Group contigs: one group per bin (--bins), otherwise one group per contig
   2. Extract CDS nucleotide sequences from assembly using GFF coordinates
-  3. Dinucleotide relative abundance (rho*) via 4-frame non-overlapping counting
-  4. 6-gene sliding window delta* = mean |window_rho - contig_rho| / 16
-  5. Threshold: strong (median + 2*SD → 6 genes), moderate (median + SD → 3 genes)
-  6. Cluster consecutive marked genes, merge gaps < 6, keep clusters >= 8 genes
-  7. HMM scan (hmmscan, E-value <= 1e-7) + keyword matching for mobility genes
-  8. Keep islands with >= 1 mobility gene, discard islands < 2000 bp
+  3. Dinucleotide relative abundance (rho*) via 4-frame non-overlapping counting;
+     the reference rho* pools every CDS in the group
+  4. 6-gene sliding windows within each contig: delta* = mean |window_rho - group_rho|
+  5. Threshold over all windows in the group: strong (median + 2*SD → 6 genes),
+     moderate (median + SD → 3 genes); SD is the sample SD, as in Perl
+  6. Cluster consecutive marked genes, merge gaps < 6, keep clusters >= 8 genes,
+     drop the last gene of each island
+  7. Mobility genes: hmmscan with Pfam gathering thresholds (--cut_ga) + keyword
+     matching; an IstB (AAA+ ATPase) hit counts only next to another mobility gene
+  8. Keep islands with >= 1 mobility gene
+
+--mode perl-compat reproduces Dimob.pl (upstream master) instead, including
+behaviour that is wrong for the biology (see PERL_COMPAT below); it exists to
+test parity, not for production use.
 
 Reference:
   Bertelli C, et al. (2018) IslandViewer 4. Nucleic Acids Res 46(W1):W59-W64.
@@ -29,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 from collections import defaultdict
+from urllib.parse import unquote
 
 # ---------------------------------------------------------------------------
 # FASTA / GFF parsing
@@ -79,10 +88,11 @@ def parse_gff_cds(path):
             gene_id = ''
             product = ''
             for attr in attrs.split(';'):
+                # GFF3 percent-encodes reserved characters in attribute values
                 if attr.startswith('ID='):
-                    gene_id = attr[3:]
+                    gene_id = unquote(attr[3:])
                 elif attr.startswith('product='):
-                    product = attr[8:]
+                    product = unquote(attr[8:])
             cds_by_contig[contig].append({
                 'contig': contig,
                 'start': start,
@@ -128,7 +138,31 @@ DINUC_KEYS = [
 VALID_BASES = set('ACGT')
 
 
-def count_dimers_nonoverlap(seq):
+# Differences between the modes. Each perl-compat entry reproduces Dimob.pl
+# master; the default does what the method describes.
+#   counting    Perl's SeqWords2 matches /[ACGT]{2}/g, so a non-ACGT base shifts
+#               the pair frame: pairs after it are double-counted or missed.
+#               Default keeps a fixed frame and skips pairs containing non-ACGT.
+#   first gene  Perl seeds its marked list with a 0 sentinel, so gene 0 of a
+#               sequence can never be marked. Default can mark it.
+#   boundaries  Perl labels window i with gene i+1 and drops marked genes past
+#               the last window, shifting islands one gene downstream and
+#               truncating islands at sequence ends. Default reports the marked
+#               genes, minus the last (the documented precision trade-off).
+#   HMM hits    Perl filters on the full-sequence E-value (<= 1e-7), which
+#               accepts proteins whose only hits are weak, repeated ATPase
+#               domains (e.g. ClpB, ClpC on IstB_IS21). Default uses Pfam's
+#               curated gathering thresholds (--cut_ga) and requires an IstB
+#               hit to sit next to another mobility gene (IstB acts with IstA;
+#               DnaA and DnaI also hit IstB).
+#   grouping    Both modes group per contig unless --bins is given; Dimob.pl
+#               itself reports only the first record of a multi-record GenBank.
+MODES = ('default', 'perl-compat')
+
+_PERL_DIMER_RE = re.compile('[ACGT]{2}')
+
+
+def count_dimers_nonoverlap(seq, perl_compat=False):
     """Count non-overlapping dimers in seq (step=2).
 
     Returns (mono_counts, di_counts) as dicts.
@@ -138,6 +172,14 @@ def count_dimers_nonoverlap(seq):
     di = defaultdict(int)
     # Ensure even length (truncate last base if odd)
     end = len(seq) if len(seq) % 2 == 0 else len(seq) - 1
+    if perl_compat:
+        seq = seq[:end]
+        for b in seq:
+            if b in VALID_BASES:
+                mono[b] += 1
+        for m in _PERL_DIMER_RE.findall(seq):
+            di[m] += 1
+        return mono, di
     for i in range(0, end, 2):
         b1 = seq[i]
         b2 = seq[i + 1] if i + 1 < len(seq) else None
@@ -150,7 +192,7 @@ def count_dimers_nonoverlap(seq):
     return mono, di
 
 
-def count_dimers_4frames(seq):
+def count_dimers_4frames(seq, perl_compat=False):
     """Count dimers across 4 frames: original, shifted+1, revcomp, revcomp+shifted.
 
     This matches the original Perl implementation which combines counts from all
@@ -163,7 +205,7 @@ def count_dimers_4frames(seq):
     rc = revcomp(seq)
 
     for s in [seq, seq[1:], rc, rc[1:]]:
-        mono, di = count_dimers_nonoverlap(s)
+        mono, di = count_dimers_nonoverlap(s, perl_compat)
         for k, v in mono.items():
             total_mono[k] += v
         for k, v in di.items():
@@ -198,67 +240,69 @@ def calc_relative_abundance(mono, di):
     return rho
 
 
-def calc_dinuc_bias(cds_list, contig_seq):
-    """Calculate per-CDS dinucleotide bias using 6-gene sliding windows.
-
-    For each contig:
-    1. Count mono/di across all CDS → genome-level rho*
-    2. Sliding window of 6 CDS → window-level rho*
-    3. delta* = mean(|window_rho - genome_rho|) across 16 dinucs * 1000
-
-    Returns list of bias values (one per sliding window position).
-    Length = max(0, n_cds - 5).
-    """
-    n = len(cds_list)
-    if n < 6:
-        return []
-
-    # Extract nucleotide sequences and per-CDS counts
-    cds_monos = []
-    cds_dis = []
+def cds_counts(cds_list, contig_seq, perl_compat=False):
+    """Per-CDS (mono, di) counts over 4 frames, in CDS order."""
+    counts = []
     for cds in cds_list:
         nuc_seq = extract_cds_nuc(contig_seq, cds)
-        mono, di = count_dimers_4frames(nuc_seq)
-        cds_monos.append(mono)
-        cds_dis.append(di)
+        counts.append(count_dimers_4frames(nuc_seq, perl_compat))
+    return counts
 
-    # Genome-level (whole contig) counts: sum all CDS
-    genome_mono = defaultdict(int)
-    genome_di = defaultdict(int)
-    for mono in cds_monos:
-        for k, v in mono.items():
-            genome_mono[k] += v
-    for di in cds_dis:
-        for k, v in di.items():
-            genome_di[k] += v
-    genome_rho = calc_relative_abundance(genome_mono, genome_di)
 
-    # 6-gene sliding window bias
+def reference_rho(count_lists):
+    """Pooled rho* over every CDS in a group (a genome, bin or contig)."""
+    ref_mono = defaultdict(int)
+    ref_di = defaultdict(int)
+    for counts in count_lists:
+        for mono, di in counts:
+            for k, v in mono.items():
+                ref_mono[k] += v
+            for k, v in di.items():
+                ref_di[k] += v
+    return calc_relative_abundance(ref_mono, ref_di)
+
+
+def window_biases(counts, ref_rho):
+    """delta* (x1000) for each 6-CDS sliding window of one contig.
+
+    Windows never span contigs. Length = max(0, n_cds - 5).
+    """
     biases = []
-    for i in range(n - 5):
+    for i in range(len(counts) - 5):
         win_mono = defaultdict(int)
         win_di = defaultdict(int)
-        for j in range(6):
-            for k, v in cds_monos[i + j].items():
+        for mono, di in counts[i:i + 6]:
+            for k, v in mono.items():
                 win_mono[k] += v
-            for k, v in cds_dis[i + j].items():
+            for k, v in di.items():
                 win_di[k] += v
         win_rho = calc_relative_abundance(win_mono, win_di)
-
-        # delta* = mean |window - genome| across 16 dinucleotides, * 1000
-        delta = sum(abs(win_rho[dk] - genome_rho[dk]) for dk in DINUC_KEYS) / 16.0
+        # delta* = mean |window - reference| across 16 dinucleotides, * 1000
+        delta = sum(abs(win_rho[dk] - ref_rho[dk]) for dk in DINUC_KEYS) / 16.0
         biases.append(delta * 1000)
-
     return biases
+
+
+def bias_threshold_stats(all_biases):
+    """(median, sample SD) of the window biases of a group; SD is None if undefined."""
+    n = len(all_biases)
+    if n < 2:
+        return None, None
+    v = sorted(all_biases)
+    median = v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0
+    mean_val = sum(v) / n
+    # Statistics::Descriptive::standard_deviation (Perl) is the sample SD
+    sd = math.sqrt(sum((x - mean_val) ** 2 for x in v) / (n - 1))
+    return median, sd
 
 # ---------------------------------------------------------------------------
 # Island detection (thresholding + clustering)
 # ---------------------------------------------------------------------------
 
-def find_dinuc_islands(biases, min_cluster=8):
-    """Identify clusters of biased genes from sliding window bias values.
+def find_dinuc_islands(biases, median, sd, min_cluster=8, perl_compat=False):
+    """Identify clusters of biased genes from one contig's window biases.
 
-    Thresholds (from original):
+    Thresholds (from original), computed over the whole group:
       - strong: median + 2*SD → mark all 6 genes in the window
       - moderate: median + SD → mark first 3 genes in the window
 
@@ -271,22 +315,7 @@ def find_dinuc_islands(biases, min_cluster=8):
 
     Returns list of (start_idx, end_idx) tuples into the CDS list (inclusive).
     """
-    if len(biases) < 1:
-        return []
-
-    # Median and SD
-    sorted_vals = sorted(biases)
-    n = len(sorted_vals)
-    if n % 2 == 0:
-        median = (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2.0
-    else:
-        median = sorted_vals[n // 2]
-
-    mean_val = sum(biases) / n
-    variance = sum((x - mean_val) ** 2 for x in biases) / n
-    sd = math.sqrt(variance)
-
-    if sd == 0:
+    if not biases or not sd:
         return []
 
     strong_thresh = median + 2 * sd
@@ -303,6 +332,8 @@ def find_dinuc_islands(biases, min_cluster=8):
             # Mark first 3 genes
             for j in range(3):
                 marked.add(i + j)
+    if perl_compat:
+        marked.discard(0)
 
     if not marked:
         return []
@@ -338,12 +369,16 @@ def find_dinuc_islands(biases, min_cluster=8):
             merged.append(cluster)
 
     # Exclude last gene of each island (per original: improves precision)
-    # Return (start_idx, end_idx) into CDS list, inclusive
     islands = []
     for cluster in merged:
-        if len(cluster) > 1:
+        if perl_compat:
+            # Perl resolves marked index k through window k's label, which
+            # names gene k+1; indices past the last window have no label.
+            kept = [k for k in cluster[:-1] if k < len(biases)]
+            if kept:
+                islands.append((kept[0] + 1, kept[-1] + 1))
+        elif len(cluster) > 1:
             islands.append((cluster[0], cluster[-2]))
-        # Single-gene cluster after exclusion: skip (can't happen with min_cluster=8)
 
     return islands
 
@@ -378,106 +413,132 @@ def find_keyword_mobility(cds_list):
     return mob_ids
 
 
-def run_hmmscan(faa_path, hmm_db, cpus=1, evalue=1e-7):
-    """Run hmmscan and return set of protein IDs with significant HMM hits.
+ISTB_MODELS = {'IstB_IS21', 'IstB_IS21_ATP'}
 
-    Uses --domtblout for easy parsing. Returns set of query names (Prokka locus tags).
+
+def run_hmmscan(faa_path, hmm_db, cpus=1, perl_compat=False, evalue=1e-7):
+    """Run hmmscan; return {protein ID: set of mobility HMM names hit}.
+
+    Default: Pfam gathering thresholds (--cut_ga) decide what counts as a hit.
+    perl-compat: full-sequence E-value <= evalue (Bio::SearchIO significance).
     """
-    mob_ids = set()
+    hits = defaultdict(set)
 
     if not os.path.isfile(faa_path) or os.path.getsize(faa_path) == 0:
-        return mob_ids
+        return hits
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.domtbl', delete=False) as tmp:
         domtbl_path = tmp.name
 
     try:
-        cmd = [
-            'hmmscan',
-            '--domtblout', domtbl_path,
-            '--noali',
-            '-E', str(evalue),
-            '--cpu', str(cpus),
-            hmm_db,
-            faa_path,
-        ]
-        subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-
-        if os.path.isfile(domtbl_path):
-            with open(domtbl_path) as fh:
-                for line in fh:
-                    if line.startswith('#'):
-                        continue
-                    fields = line.split()
-                    if len(fields) >= 13:
-                        query_name = fields[3]
-                        domain_evalue = float(fields[12])
-                        if domain_evalue <= evalue:
-                            mob_ids.add(query_name)
+        cmd = ['hmmscan', '--domtblout', domtbl_path, '--noali', '--cpu', str(cpus)]
+        cmd += ['-E', str(evalue)] if perl_compat else ['--cut_ga']
+        cmd += [hmm_db, faa_path]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if res.returncode != 0:
+            # A failed scan must not look like "no mobility genes".
+            raise RuntimeError(f"hmmscan failed (exit {res.returncode}): {res.stderr.strip()}")
+        with open(domtbl_path) as fh:
+            for line in fh:
+                if line.startswith('#'):
+                    continue
+                fields = line.split()
+                if len(fields) < 13:
+                    continue
+                model, query_name = fields[0], fields[3]
+                # perl-compat: full-sequence E-value (col 7); with --cut_ga,
+                # hmmscan reports only hits that pass the curated thresholds.
+                if not perl_compat or float(fields[6]) <= evalue:
+                    hits[query_name].add(model)
     finally:
         if os.path.isfile(domtbl_path):
             os.unlink(domtbl_path)
 
-    return mob_ids
+    return hits
+
+
+def mobility_gene_ids(cds_list, hmm_hits, perl_compat=False, istb_neighbourhood=2):
+    """IDs of mobility genes on one contig (HMM hits + product keywords).
+
+    Default: a gene whose only evidence is an IstB HMM hit counts only if
+    another mobility gene lies within istb_neighbourhood genes on the contig.
+    """
+    keyword = find_keyword_mobility(cds_list)
+    ids = [c['gene_id'] for c in cds_list]
+    if perl_compat:
+        return keyword | {g for g in ids if hmm_hits.get(g)}
+    strong = [g in keyword or bool(hmm_hits.get(g, set()) - ISTB_MODELS) for g in ids]
+    mob = set()
+    for i, g in enumerate(ids):
+        if strong[i]:
+            mob.add(g)
+        elif hmm_hits.get(g):
+            lo, hi = max(0, i - istb_neighbourhood), i + istb_neighbourhood + 1
+            if any(strong[lo:i] + strong[i + 1:hi]):
+                mob.add(g)
+    return mob
 
 # ---------------------------------------------------------------------------
 # Per-contig pipeline
 # ---------------------------------------------------------------------------
 
-def process_contig(contig_id, contig_seq, cds_list, hmm_mob_ids, min_island_bp=2000):
-    """Run full IslandPath-DIMOB on one contig.
+def process_group(contigs, assembly, cds_by_contig, hmm_hits, perl_compat=False,
+                  min_island_bp=0, min_cds=8):
+    """Run IslandPath-DIMOB on one group of contigs (a bin, or a single contig).
 
-    Returns list of dicts: {contig, start, end} for each island.
+    The reference signature and the bias threshold come from the whole group;
+    windows and islands stay within contigs. Returns [{contig, start, end}].
     """
-    n_cds = len(cds_list)
-    if n_cds < 8:
+    members = [c for c in contigs if len(cds_by_contig.get(c, [])) >= 6]
+    if sum(len(cds_by_contig[c]) for c in members) < min_cds:
+        return []
+    counts = {c: cds_counts(cds_by_contig[c], assembly[c], perl_compat) for c in members}
+    ref = reference_rho(counts.values())
+    biases = {c: window_biases(counts[c], ref) for c in members}
+    median, sd = bias_threshold_stats([b for c in members for b in biases[c]])
+    if sd is None:
         return []
 
-    # 1. Dinucleotide bias
-    biases = calc_dinuc_bias(cds_list, contig_seq)
-    if not biases:
-        return []
-
-    # 2. Dinucleotide islands
-    dinuc_islands = find_dinuc_islands(biases, min_cluster=8)
-    if not dinuc_islands:
-        return []
-
-    # 3. Keyword-based mobility genes
-    keyword_mob = find_keyword_mobility(cds_list)
-
-    # 4. Combined mobility gene set
-    all_mob_ids = hmm_mob_ids | keyword_mob
-
-    # 5. Filter: keep islands with >= 1 mobility gene
     islands = []
-    for start_idx, end_idx in dinuc_islands:
-        island_cds = cds_list[start_idx:end_idx + 1]
-        island_gene_ids = {cds['gene_id'] for cds in island_cds}
-
-        has_mobility = bool(island_gene_ids & all_mob_ids)
-        if not has_mobility:
+    for c in members:
+        cds_list = cds_by_contig[c]
+        if len(cds_list) < 8:
             continue
-
-        # Size filter
-        island_start = island_cds[0]['start']
-        island_end = island_cds[-1]['end']
-        island_size = island_end - island_start + 1
-        if island_size < min_island_bp:
+        dinuc_islands = find_dinuc_islands(biases[c], median, sd, 8, perl_compat)
+        if not dinuc_islands:
             continue
-
-        islands.append({
-            'contig': contig_id,
-            'start': island_start,
-            'end': island_end,
-        })
-
+        mob_ids = mobility_gene_ids(cds_list, hmm_hits, perl_compat)
+        for start_idx, end_idx in dinuc_islands:
+            island_cds = cds_list[start_idx:end_idx + 1]
+            if not {x['gene_id'] for x in island_cds} & mob_ids:
+                continue
+            island_start = island_cds[0]['start']
+            island_end = island_cds[-1]['end']
+            if island_end - island_start + 1 < min_island_bp:
+                continue
+            islands.append({'contig': c, 'start': island_start, 'end': island_end})
     return islands
+
+
+def read_bins(path, assembly):
+    """contig -> bin from a two-column TSV (contig<TAB>bin, as DAS Tool writes)."""
+    bins, unknown = {}, 0
+    with open(path) as fh:
+        for line in fh:
+            if not line.strip() or line.startswith('#'):
+                continue
+            contig, b = line.rstrip('\n').split('\t')[:2]
+            if contig in assembly:
+                bins[contig] = b
+            else:
+                unknown += 1
+    if not bins:
+        raise SystemExit(f'[ERROR] no contig in {path} matches the assembly '
+                         '(expected contig<TAB>bin)')
+    if unknown:
+        print(f'[WARNING] {unknown} lines in {path} name contigs not in the assembly',
+              file=sys.stderr)
+    return bins
 
 # ---------------------------------------------------------------------------
 # Main
@@ -492,6 +553,13 @@ def main():
     parser.add_argument('--faa', required=True, help='Prokka protein FASTA (.faa)')
     parser.add_argument('--hmm_db', required=True, help='Path to HMM database (Pfam mobility gene profiles)')
     parser.add_argument('--cpus', type=int, default=1, help='CPUs for hmmscan')
+    parser.add_argument('--bins', help='contig<TAB>bin table: reference signature and '
+                        'threshold per bin instead of per contig (recommended for MAGs)')
+    parser.add_argument('--mode', choices=MODES, default='default',
+                        help='perl-compat reproduces Dimob.pl, including its bugs '
+                        '(for parity testing)')
+    parser.add_argument('--min_island_bp', type=int, default=0,
+                        help='drop islands shorter than this (Dimob.pl applies none)')
     parser.add_argument('-o', '--output', required=True, help='Output TSV file')
     args = parser.parse_args()
 
@@ -510,27 +578,32 @@ def main():
 
     # Run batch HMM scan on all proteins
     print(f'[INFO] Running hmmscan on {args.faa} ({args.cpus} CPUs)', file=sys.stderr)
-    hmm_mob_ids = run_hmmscan(args.faa, args.hmm_db, cpus=args.cpus, evalue=1e-7)
-    print(f'[INFO] HMM mobility genes found: {len(hmm_mob_ids)}', file=sys.stderr)
+    perl_compat = args.mode == 'perl-compat'
+    hmm_hits = run_hmmscan(args.faa, args.hmm_db, cpus=args.cpus, perl_compat=perl_compat)
+    print(f'[INFO] Proteins with mobility HMM hits: {len(hmm_hits)}', file=sys.stderr)
 
-    # Process each contig
-    all_islands = []
-    contigs_processed = 0
-    contigs_with_islands = 0
-
+    contigs = []
     for contig_id in sorted(cds_by_contig.keys()):
         if contig_id not in assembly:
             print(f'[WARNING] Contig {contig_id} in GFF but not in FASTA — skipping', file=sys.stderr)
             continue
+        contigs.append(contig_id)
 
-        cds_list = cds_by_contig[contig_id]
-        contig_seq = assembly[contig_id]
-        contigs_processed += 1
+    # One group per bin; unbinned contigs (or every contig, without --bins) alone
+    groups = defaultdict(list)
+    bins = read_bins(args.bins, assembly) if args.bins else {}
+    for c in contigs:
+        groups[('bin', bins[c]) if c in bins else ('contig', c)].append(c)
+    print(f'[INFO] Mode: {args.mode}; groups: {sum(k[0] == "bin" for k in groups)} bins, '
+          f'{sum(k[0] == "contig" for k in groups)} single contigs', file=sys.stderr)
 
-        islands = process_contig(contig_id, contig_seq, cds_list, hmm_mob_ids)
-        if islands:
-            contigs_with_islands += 1
-            all_islands.extend(islands)
+    all_islands = []
+    for key in sorted(groups):
+        all_islands.extend(process_group(groups[key], assembly, cds_by_contig, hmm_hits,
+                                         perl_compat, args.min_island_bp))
+    all_islands.sort(key=lambda x: (x['contig'], x['start']))
+    contigs_processed = len(contigs)
+    contigs_with_islands = len({x['contig'] for x in all_islands})
 
     # Write output
     print(f'[INFO] Contigs processed: {contigs_processed}', file=sys.stderr)

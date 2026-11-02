@@ -12,18 +12,48 @@ The latest IslandPath-DIMOB version is integrated in [IslandViewer 4](http://www
 This fork includes a **Python reimplementation** (`islandpath_dimob.py`) that works directly with GFF3 + FASTA + FAA inputs from tools like Prokka, removing the dependency on GenBank (.gbk) files and broken Perl BioPerl modules.
 
 The Python version implements the same algorithm as the original Perl tool:
-1. Per-contig dinucleotide relative abundance (4-frame non-overlapping dimer counting)
-2. 6-gene sliding window bias scoring (delta* = mean |window_rho - contig_rho|)
-3. Thresholding (median + 2*SD strong, median + SD moderate)
-4. Clustering (consecutive marked genes, merge gaps < 6, keep clusters >= 8)
-5. Mobility gene filtering via HMM scan (hmmscan, E-value <= 1e-7) + keyword matching
-6. Size filter (discard islands < 2000 bp)
+1. Dinucleotide relative abundance (4-frame non-overlapping dimer counting); the reference signature pools every CDS of a bin (`--bins`) or, without bins, of a contig
+2. 6-gene sliding window bias scoring within each contig (delta* = mean |window_rho - reference_rho|)
+3. Thresholding over all windows of the bin or contig (median + 2*SD strong, median + SD moderate; sample SD)
+4. Clustering (consecutive marked genes, merge gaps < 6, keep clusters >= 8, drop the last gene)
+5. Mobility gene filtering via HMM scan (Pfam gathering thresholds, `--cut_ga`) + keyword matching
+6. Islands must contain at least one mobility gene
+
+### Modes and parity with Dimob.pl
+
+`--mode perl-compat` reproduces Dimob.pl (upstream master) island for island:
+it gives identical coordinates on *Listeria monocytogenes* EGD-e (NC_003210, 3
+islands) and *E. coli* K-12 MG1655 (NC_000913, 17 islands) when GFF3/FASTA/FAA
+are generated from the same GenBank record. It exists to test parity.
+
+The default mode departs from Dimob.pl where Dimob.pl is wrong for the biology:
+
+| behaviour | Dimob.pl (perl-compat) | default |
+|---|---|---|
+| island boundaries | window *i* is labelled with gene *i*+1, so islands shift one gene downstream; marked genes past the last window are dropped, truncating islands at sequence ends | the marked genes, minus the last |
+| first gene of a sequence | can never be marked (a 0 sentinel) | can be marked |
+| non-ACGT bases | `/[ACGT]{2}/g` restarts after an N, so pairs are double-counted or missed | fixed frame; pairs with non-ACGT skipped |
+| HMM mobility hits | full-sequence E-value <= 1e-7: accepts ClpB/ClpC on two weak IstB_IS21 ATPase-domain hits | Pfam gathering thresholds; an IstB hit counts only within 2 genes of another mobility gene (DnaA, DnaC/DnaI also hit IstB) |
+| statistics | per genome (Dimob.pl reports only the first record of a multi-record GenBank) | per bin with `--bins`, otherwise per contig |
+
+On MG1655 the default reports 16 islands: 15 are Dimob.pl's islands shifted one
+gene upstream; the DnaA-only island at the replication origin is gone; one
+island whose only mobility gene is its first gene (b0132, Transposase_31) is
+found; and one island whose only mobility evidence is its last gene, FxsA
+("suppressor of F exclusion of phage T7", a keyword match), is not.
+
+**Use `--bins` for metagenomes.** Per-contig statistics on a short contig come
+from a handful of windows, and a contig that is entirely foreign (a plasmid,
+prophage or island fragment) cannot show bias against itself. With
+`--bins contig2bin.tsv` (contig<TAB>bin, as DAS Tool writes it) the reference
+signature and threshold come from the whole MAG; unbinned contigs fall back to
+per-contig statistics.
 
 ### Why?
 
 - The original Perl tool requires GenBank (.gbk) input, but Prokka's `tbl2asn` hangs on large metagenomes
 - Bioconda's `perl-bioperl 1.7.8` doesn't include `Bio::Perl` (split into `perl-bio-procedural`)
-- Metagenome assemblies need per-contig processing (each contig is a different organism)
+- Metagenome assemblies need per-genome statistics: per bin with `--bins`, otherwise per contig
 - The Python version adds a `contig` column to the output (essential for metagenomes)
 
 ### Python Dependencies
@@ -41,8 +71,11 @@ islandpath_dimob.py \
     --faa prokka.faa \
     --hmm_db hmmpfam/Pfam-A_mobgenes_201512_prok \
     --cpus 4 \
+    --bins contig2bin.tsv \
     -o genomic_islands.tsv
 ```
+
+Tests: `python3 -m pytest tests`.
 
 Output: tab-separated `island_id`, `contig`, `start`, `end`.
 
